@@ -73,7 +73,7 @@
       attempts.set(id,p);
       pc.ondatachannel=e=>attachChannel(p,e.channel);
       pc.onconnectionstatechange=()=>{if(['failed','closed','disconnected'].includes(pc.connectionState)){
-        const was = active === p; attempts.delete(p.id);safeClose(p);
+        const was = active === p; attempts.delete(p.id);if(!was && pc.connectionState==='failed')state('ice-failed');safeClose(p);
         if(was){active=null;state('offline');}
       }};
       return p;
@@ -167,16 +167,16 @@
       if(stopped)return;
       let s;try{s=new WebSocketCtor(url);}catch{reconnectTracker(url);return;}
       trackSockets.set(url,s);
-      s.onopen=()=>{if(stopped)return;announce(s);if(role==='office')startOffer(s);};
+      s.onopen=()=>{if(stopped)return;state('tracker-ready');announce(s);if(role==='office')startOffer(s);};
       s.onmessage=event=>{
         if(stopped||typeof event.data!=='string'||event.data.length>90000)return;
         let m;try{m=JSON.parse(event.data);}catch{return;}
         if(m?.action!=='announce'||m.info_hash!==room)return;
-        if(m.offer)receivedOffer(s,m).catch(()=>{});
-        if(m.answer)receivedAnswer(m).catch(()=>{});
+        if(m.offer){state('offer-received');receivedOffer(s,m).catch(()=>{});}
+        if(m.answer){state('answer-received');receivedAnswer(m).catch(()=>{});}
       };
       s.onclose=()=>{if(trackSockets.get(url)!==s)return;trackSockets.delete(url);reconnectTracker(url);};
-      s.onerror=()=>{};
+      s.onerror=()=>{if(!stopped)state('tracker-error');};
     }
     function reconnectTracker(url){if(!stopped)setTimeout(()=>attachTracker(url),4000+Math.floor(Math.random()*4000));}
     async function start(){
