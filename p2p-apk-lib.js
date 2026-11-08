@@ -1,5 +1,5 @@
 /*
- * Michbasot Service: P2P R6 - bounded retry, tracker acknowledgement and ICE diagnostics.
+ * Michbasot Service: P2P R8 - tracker-compatible authenticated SDP signaling + bounded retry.
  * NOT a complete app transport. Initial room signaling uses a public tracker; authenticated APK data travels on WebRTC.
  * No hard-coded shared secret. Bootstrap room uses the one-time invitation token hash.
  * Public WSS trackers only exchange SDP/ICE; keys and business data are not signaled.
@@ -34,10 +34,30 @@
   async function makeAuthProof(secretHex, role, ownNonce, otherNonce, crypto = scope.crypto) {
     return hmac(secretHex, proofInput(role, ownNonce, otherNonce), crypto);
   }
-  function validPeerPacket(type, p) {
-    return p && p.type === type && value(p.sdp) && p.sdp.length < 30000 &&
-      p.sdp.startsWith('v=0') && /^[a-f0-9]{64}$/i.test(p.mac || '');
+  // WebTorrent/Aquatic trackers parse an RTC offer/answer as {type,sdp} only.
+  // They can discard custom JSON fields (including mac), which previously made
+  // a valid offer unverifiable at the office. Carry the MAC inside the SDP text
+  // and remove it *before* calling WebRTC. Fail closed if proof is missing/bad.
+  const PROOF_LINE = 'a=x-michbasot-proof:';
+  function unpackSignal(type, p) {
+    if (!p || p.type !== type || !value(p.sdp) || p.sdp.length >= 30000 ||
+        !p.sdp.startsWith('v=0')) return null;
+    const index = p.sdp.lastIndexOf(PROOF_LINE);
+    if (index >= 2 && p.sdp.slice(index-2,index) === '\r\n' &&
+        p.sdp.endsWith('\r\n')) {
+      const mac = p.sdp.slice(index + PROOF_LINE.length, -2);
+      if (/^[a-f0-9]{64}$/i.test(mac)) {
+        const sdp = p.sdp.slice(0,index);
+        return {sdp,mac:mac.toLowerCase()};
+      }
+      return null;
+    }
+    // Preserve read-only parsing for older R6 signaling if the tracker keeps
+    // extra JSON fields; the new sender always uses embedded proof.
+    if (/^[a-f0-9]{64}$/i.test(p.mac || '')) return {sdp:p.sdp,mac:p.mac.toLowerCase()};
+    return null;
   }
+  function validPeerPacket(type,p) { return !!unpackSignal(type,p); }
 
   function createDeviceLink({role, secretHex, trackers=defaultTrackers, iceServers=defaultIce,
        onStatus=()=>{}, onData=()=>{}, crypto=scope.crypto, WebSocketCtor=scope.WebSocket,
@@ -60,12 +80,17 @@
         left:1,event:'started',numwant:Math.min(offers.length,5),offers});
     }
     async function authenticatedPacket(type,id,sender,target,sdp) {
-      return {type,sdp,mac:await hmac(secretHex,macInput(type,id,sender,target,sdp),crypto)};
+      // Normalize SDP line endings to guarantee the signed and transmitted
+      // bytes are identical. Extra proof is NOT passed to RTCPeerConnection.
+      const pure = sdp.endsWith('\r\n') ? sdp : sdp + '\r\n';
+      const mac = await hmac(secretHex,macInput(type,id,sender,target,pure),crypto);
+      return {type,sdp:pure + PROOF_LINE + mac + '\r\n'};
     }
     async function verified(type,id,sender,target,packet){
-      if(!validPeerPacket(type,packet))return false;
-      const expect = await hmac(secretHex,macInput(type,id,sender,target,packet.sdp),crypto);
-      return expect === packet.mac.toLowerCase();
+      const unpacked = unpackSignal(type,packet);
+      if(!unpacked)return null;
+      const expect = await hmac(secretHex,macInput(type,id,sender,target,unpacked.sdp),crypto);
+      return expect === unpacked.mac ? unpacked.sdp : null;
     }
     function createCandidate(id, socket){
       const pc = new RtcCtor({iceServers});
@@ -120,11 +145,12 @@
       if(stopped || role!=='office' || isReady() || attempts.size>3 ||
          !value(m.offer_id) || m.offer_id.length!==20 || !value(m.peer_id) || m.peer_id.length!==20 || m.peer_id===ownPeer)return;
       // Fail CLOSED. Never process or respond to unauthenticated SDP.
-      if(!await verified('offer',m.offer_id,m.peer_id,'',m.offer))return;
+      const verifiedSdp = await verified('offer',m.offer_id,m.peer_id,'',m.offer);
+      if(verifiedSdp === null)return;
       state('offer-received');
       const p=createCandidate('answer:'+hex(enc.encode(m.offer_id)),s);
       try{
-        await p.pc.setRemoteDescription({type:'offer',sdp:m.offer.sdp});
+        await p.pc.setRemoteDescription({type:'offer',sdp:verifiedSdp});
         await p.pc.setLocalDescription(await p.pc.createAnswer());await waitIce(p.pc);
         if(stopped || !attempts.has(p.id))return;
         const packet=await authenticatedPacket('answer',m.offer_id,ownPeer,m.peer_id,p.pc.localDescription.sdp);
@@ -137,9 +163,10 @@
          !value(m.peer_id) || m.peer_id.length!==20)return;
       const p=attempts.get(m.offer_id);
       if(!p || p.pc.signalingState!=='have-local-offer')return;
-      if(!await verified('answer',m.offer_id,m.peer_id,ownPeer,m.answer))return;
+      const verifiedSdp = await verified('answer',m.offer_id,m.peer_id,ownPeer,m.answer);
+      if(verifiedSdp === null)return;
       state('answer-received');
-      try{await p.pc.setRemoteDescription({type:'answer',sdp:m.answer.sdp});}
+      try{await p.pc.setRemoteDescription({type:'answer',sdp:verifiedSdp});}
       catch{ attempts.delete(p.id);safeClose(p);state('answer-failed'); }
     }
     async function incoming(p, data){
