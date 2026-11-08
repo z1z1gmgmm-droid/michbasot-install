@@ -1,13 +1,14 @@
+// MB_PHONE_CHAIN_CONNECTION_STATUS_20261108_R5
 (()=>{'use strict';
 const $=id=>document.getElementById(id), tok=new URLSearchParams(location.search).get('t')||'';
 const names={driver:'Michbasot_Driver.apk',manager:'Michbasot_Manager.apk',client:'Michbasot_Client.apk'};
-let link=null,phone='',requested=false,otp=false,verified=false,closed=false,meta=null,parts=[],next=0,total=0,expiryTimer=null,otpReaderAbort=null,pendingAutoCode=null,requestSent=false;
+let link=null,phone='',requested=false,otp=false,verified=false,closed=false,meta=null,parts=[],next=0,total=0,expiryTimer=null,otpReaderAbort=null,pendingAutoCode=null,requestSent=false,phase='initial';
 function show(id){for(const section of ['phoneBox','otpBox','progressBox'])$(section).classList.toggle('hidden',section!==id)}
 function status(message){$('status').textContent=message}
 function hex(bytes){return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('')}
 function send(data){return link?.isReady()&&link.send(data)}
 function normalize(value){let n=value.replace(/[\s()-]/g,'').trim();if(n.startsWith('00972'))n='0'+n.slice(5);else if(n.startsWith('+972'))n='0'+n.slice(4);else if(n.startsWith('972'))n='0'+n.slice(3);return n}
-function error(message){status(message);$('verify').disabled=false;$('request').disabled=false}
+function error(message){clearTimeout(expiryTimer);requested=false;requestSent=false;phase='error';status(message);$('verify').disabled=false;$('request').disabled=false}
 // On supported Android Chrome browsers, WebOTP may offer to capture the SMS.
 // A browser consent prompt may appear. Manual code entry always remains available.
 function beginSmsCapture(){
@@ -29,19 +30,26 @@ function submitCode(code){
  if(!send({kind:'apk_verify',phone,code}))error('התקשורת עם המשרד התנתקה. נסה שוב.');
 }
 
-function ready(){if(requested&&!otp&&!requestSent&&link?.isReady()){requestSent=true;if(!send({kind:'apk_request',phone})){requestSent=false;return;}status('שולחים קוד אימות לטלפון...')}}
+function ready(){if(requested&&!otp&&!requestSent&&link?.isReady()){requestSent=true;phase='request-sent';if(!send({kind:'apk_request',phone})){requestSent=false;phase='p2p-online';return;}status('הבקשה הועברה למשרד. ממתינים לאישור שליחת SMS...')}}
 async function connect(){
  if(!/^[A-Za-z0-9_-]{32,200}$/.test(tok)){error('קישור ההזמנה אינו תקין.');return}
  if(!window.isSecureContext||!crypto?.subtle||!window.MichbasotDeviceLink){error('לא ניתן לפתוח את ההזמנה בדפדפן זה.');return}
  const key=hex(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(tok))));
  link=window.MichbasotDeviceLink.createDeviceLink({role:'device',secretHex:key,
-  onStatus:s=>{if(s==='online')ready()},onData:m=>{handle(m).catch(()=>error('ההורדה נכשלה. נסה שוב.'))}});
+  onStatus:s=>{
+    if(s==='online'){phase='p2p-online';status('נוצר חיבור ישיר למשרד. מאמתים את המספר...');ready();}
+    else if(requested&&!otp&&s==='tracker-ready'){phase='tracker-ready';status('מאתרים את המשרד. טרם נשלח קוד אימות...');}
+    else if(requested&&!otp&&s==='answer-received'){phase='answer-received';status('המשרד השיב. משלימים חיבור P2P...');}
+    else if(requested&&!otp&&s==='tracker-error'){phase='tracker-error';status('שרת התיווך לא זמין. מנסים שוב להתחבר...');}
+    else if(requested&&!otp&&s==='ice-failed'){phase='ice-failed';status('חיבור האינטרנט הישיר נכשל. מנסים מחדש...');}
+    else if(requested&&!otp&&s==='offline'){phase='offline';status('ממתינים לתשובה מהמשרד. טרם נשלח SMS...');}
+  },onData:m=>{handle(m).catch(()=>error('ההורדה נכשלה. נסה שוב.'))}});
  await link.start();ready();
 }
 async function handle(m){
  if(!m||typeof m!=='object')return;
  if(m.kind==='apk_otp_sent'){
-  otp=true;clearTimeout(expiryTimer);show('otpBox');status('');$('code').focus();
+  otp=true;phase='otp-accepted';clearTimeout(expiryTimer);show('otpBox');status('הבקשה לשליחת SMS אושרה במשרד. ממתינים לקוד...');$('code').focus();
   if(pendingAutoCode){const code=pendingAutoCode;pendingAutoCode=null;submitCode(code);}
  }else if(m.kind==='apk_error'){
   error(otp?'הקוד שגוי או פג תוקף. בדוק ונסה שוב.':'לא ניתן לשלוח קוד. בדוק שהמספר תואם להזמנה ונסה שוב.');
@@ -74,9 +82,9 @@ async function handle(m){
 $('request').addEventListener('click',async()=>{
  if(requested)return;
  const p=normalize($('phone').value);if(!/^\+?[0-9]{7,15}$/.test(p)){error('יש להקליד מספר טלפון תקין.');return}
- phone=p;requested=true;requestSent=false;$('request').disabled=true;status('יוצרים קשר עם המשרד...');beginSmsCapture();
+ phone=p;requested=true;requestSent=false;phase='connecting';$('request').disabled=true;status('יוצרים קשר עם המשרד. טרם נשלח SMS...');beginSmsCapture();
  try{if(!link)await connect();else ready();}catch{requested=false;link?.stop();link=null;error('לא הצלחנו לשלוח קוד. נסה שוב.');return}
- expiryTimer=setTimeout(()=>{if(!otp&&!closed){requested=false;link?.stop();link=null;otpReaderAbort?.abort();error('המשרד לא השיב לבקשת האימות. בדקו שחיבור הזמנות P2P במשרד פעיל.')}},75000);
+ expiryTimer=setTimeout(()=>{if(!otp&&!closed){link?.stop();link=null;otpReaderAbort?.abort();error('לא התקבל אישור מהמשרד ('+phase+'). אפשר ללחוץ שוב כדי לנסות להתחבר.')}},75000);
 });
 $('verify').addEventListener('click',()=>submitCode($('code').value.trim()));
 window.addEventListener('pagehide',()=>{closed=true;clearTimeout(expiryTimer);otpReaderAbort?.abort();link?.stop()});
