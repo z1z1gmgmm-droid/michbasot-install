@@ -1,4 +1,4 @@
-// MB_PHONE_CHAIN_CONNECTION_STATUS_20261108_R5
+// MB_PHONE_CHAIN_CONNECTION_STATUS_20261108_R6
 (()=>{'use strict';
 const $=id=>document.getElementById(id), tok=new URLSearchParams(location.search).get('t')||'';
 const names={driver:'Michbasot_Driver.apk',manager:'Michbasot_Manager.apk',client:'Michbasot_Client.apk'};
@@ -38,7 +38,11 @@ async function connect(){
  link=window.MichbasotDeviceLink.createDeviceLink({role:'device',secretHex:key,
   onStatus:s=>{
     if(s==='online'){phase='p2p-online';status('נוצר חיבור ישיר למשרד. מאמתים את המספר...');ready();}
-    else if(requested&&!otp&&s==='tracker-ready'){phase='tracker-ready';status('מאתרים את המשרד. טרם נשלח קוד אימות...');}
+    else if(requested&&!otp&&s==='tracker-open'){phase='tracker-open';status('נוצר קשר עם שירות התיווך. ממתינים למשרד...');}
+    else if(requested&&!otp&&s==='tracker-ready'){phase='tracker-ready';status('שירות התיווך אישר את הבקשה. מחפשים את המשרד...');}
+    else if(requested&&!otp&&s==='offer-sent'){phase='offer-sent';status('נשלחה הצעת חיבור P2P למשרד. ממתינים לתשובה...');}
+    else if(requested&&!otp&&s==='offer-failed'){phase='offer-failed';status('הצעת החיבור נכשלה. מבצעים ניסיון חוזר...');}
+    else if(requested&&!otp&&s==='answer-failed'){phase='answer-failed';status('תשובת החיבור אינה תקינה. מבצעים ניסיון חוזר...');}
     else if(requested&&!otp&&s==='answer-received'){phase='answer-received';status('המשרד השיב. משלימים חיבור P2P...');}
     else if(requested&&!otp&&s==='tracker-error'){phase='tracker-error';status('שרת התיווך לא זמין. מנסים שוב להתחבר...');}
     else if(requested&&!otp&&s==='ice-failed'){phase='ice-failed';status('חיבור האינטרנט הישיר נכשל. מנסים מחדש...');}
@@ -84,7 +88,7 @@ $('request').addEventListener('click',async()=>{
  const p=normalize($('phone').value);if(!/^\+?[0-9]{7,15}$/.test(p)){error('יש להקליד מספר טלפון תקין.');return}
  phone=p;requested=true;requestSent=false;phase='connecting';$('request').disabled=true;status('יוצרים קשר עם המשרד. טרם נשלח SMS...');beginSmsCapture();
  try{if(!link)await connect();else ready();}catch{requested=false;link?.stop();link=null;error('לא הצלחנו לשלוח קוד. נסה שוב.');return}
- expiryTimer=setTimeout(()=>{if(!otp&&!closed){link?.stop();link=null;otpReaderAbort?.abort();error('לא התקבל אישור מהמשרד ('+phase+'). אפשר ללחוץ שוב כדי לנסות להתחבר.')}},75000);
+ expiryTimer=setTimeout(()=>{if(!otp&&!closed){link?.stop();link=null;otpReaderAbort?.abort();error('לא התקבל אישור מהמשרד ('+phase+'). אפשר ללחוץ שוב כדי לנסות להתחבר.')}},150000);
 });
 $('verify').addEventListener('click',()=>submitCode($('code').value.trim()));
 window.addEventListener('pagehide',()=>{closed=true;clearTimeout(expiryTimer);otpReaderAbort?.abort();link?.stop()});
