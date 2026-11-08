@@ -1,7 +1,7 @@
 /*
  * Michbasot Service: per-device, best-effort WebRTC rendezvous / keepalive.
- * NOT a complete app transport. Does not publish APKs or deliver messages/photos.
- * No hard-coded shared secret. Provision a unique 32-byte key after user verification.
+ * NOT a complete app transport. Initial room signaling uses a public tracker; authenticated APK data travels on WebRTC.
+ * No hard-coded shared secret. Bootstrap room uses the one-time invitation token hash.
  * Public WSS trackers only exchange SDP/ICE; keys and business data are not signaled.
  * Public trackers can fail and STUN-only ICE will fail behind certain NATs.
  * The application backend MUST authorize every business operation by device/user/hotel.
@@ -89,7 +89,7 @@
       });
     }
     async function startOffer(s){
-      if(stopped || role!=='office' || isReady() || attempts.size>3 || s.readyState!==1)return;
+      if(stopped || role!=='device' || isReady() || attempts.size>3 || s.readyState!==1)return;
       const offerId=binary(rand(crypto,20));const p=createCandidate(offerId,s);
       try {
         attachChannel(p,p.pc.createDataChannel('michbasot-service-v1',{ordered:true}));
@@ -100,10 +100,11 @@
       }catch{ attempts.delete(p.id);safeClose(p); }
     }
     async function receivedOffer(s,m){
-      if(stopped || role!=='device' || isReady() || attempts.size>3 ||
+      if(stopped || role!=='office' || isReady() || attempts.size>3 ||
          !value(m.offer_id) || m.offer_id.length!==20 || !value(m.peer_id) || m.peer_id.length!==20 || m.peer_id===ownPeer)return;
       // Fail CLOSED. Never process or respond to unauthenticated SDP.
       if(!await verified('offer',m.offer_id,m.peer_id,'',m.offer))return;
+      state('offer-received');
       const p=createCandidate('answer:'+hex(enc.encode(m.offer_id)),s);
       try{
         await p.pc.setRemoteDescription({type:'offer',sdp:m.offer.sdp});
@@ -115,11 +116,12 @@
       }catch{ attempts.delete(p.id);safeClose(p); }
     }
     async function receivedAnswer(m){
-      if(stopped || role!=='office' || !value(m.offer_id) || m.offer_id.length!==20 ||
+      if(stopped || role!=='device' || !value(m.offer_id) || m.offer_id.length!==20 ||
          !value(m.peer_id) || m.peer_id.length!==20)return;
       const p=attempts.get(m.offer_id);
       if(!p || p.pc.signalingState!=='have-local-offer')return;
       if(!await verified('answer',m.offer_id,m.peer_id,ownPeer,m.answer))return;
+      state('answer-received');
       try{await p.pc.setRemoteDescription({type:'answer',sdp:m.answer.sdp});}
       catch{ attempts.delete(p.id);safeClose(p); }
     }
@@ -167,13 +169,13 @@
       if(stopped)return;
       let s;try{s=new WebSocketCtor(url);}catch{reconnectTracker(url);return;}
       trackSockets.set(url,s);
-      s.onopen=()=>{if(stopped)return;state('tracker-ready');announce(s);if(role==='office')startOffer(s);};
+      s.onopen=()=>{if(stopped)return;state('tracker-ready');announce(s);if(role==='device')startOffer(s);};
       s.onmessage=event=>{
         if(stopped||typeof event.data!=='string'||event.data.length>90000)return;
         let m;try{m=JSON.parse(event.data);}catch{return;}
         if(m?.action!=='announce'||m.info_hash!==room)return;
-        if(m.offer){state('offer-received');receivedOffer(s,m).catch(()=>{});}
-        if(m.answer){state('answer-received');receivedAnswer(m).catch(()=>{});}
+        if(m.offer){receivedOffer(s,m).catch(()=>{});}
+        if(m.answer){receivedAnswer(m).catch(()=>{});}
       };
       s.onclose=()=>{if(trackSockets.get(url)!==s)return;trackSockets.delete(url);reconnectTracker(url);};
       s.onerror=()=>{if(!stopped)state('tracker-error');};
@@ -188,7 +190,7 @@
       schedule=setInterval(()=>{
         if(stopped)return;
         for(const [k,p] of attempts){if(Date.now()-p.created>70000 && !p.authorized){safeClose(p);attempts.delete(k);}}
-        if(!isReady() && role==='office')for(const s of trackSockets.values())startOffer(s);
+        if(!isReady() && role==='device')for(const s of trackSockets.values())startOffer(s);
       }, Math.max(reconnectMs,14000));
       timer=setInterval(()=>{
         if(!isReady())return;
