@@ -1,5 +1,5 @@
 /*
- * Michbasot Service: per-device, best-effort WebRTC rendezvous / keepalive.
+ * Michbasot Service: P2P R6 - bounded retry, tracker acknowledgement and ICE diagnostics.
  * NOT a complete app transport. Initial room signaling uses a public tracker; authenticated APK data travels on WebRTC.
  * No hard-coded shared secret. Bootstrap room uses the one-time invitation token hash.
  * Public WSS trackers only exchange SDP/ICE; keys and business data are not signaled.
@@ -72,10 +72,23 @@
       const p={id,pc,socket,channel:null,ours:null,theirs:null,proved:false,proofSent:false,authorized:false,created:Date.now()};
       attempts.set(id,p);
       pc.ondatachannel=e=>attachChannel(p,e.channel);
-      pc.onconnectionstatechange=()=>{if(['failed','closed','disconnected'].includes(pc.connectionState)){
-        const was = active === p; attempts.delete(p.id);if(!was && pc.connectionState==='failed')state('ice-failed');safeClose(p);
-        if(was){active=null;state('offline');}
-      }};
+      pc.onconnectionstatechange=()=>{
+        if(['failed','closed','disconnected'].includes(pc.connectionState)){
+          const was = active === p;
+          attempts.delete(p.id);
+          if(pc.connectionState==='failed')state('ice-failed');
+          safeClose(p);
+          if(was){active=null;state('offline');}
+        }
+      };
+      pc.oniceconnectionstatechange=()=>{
+        if(pc.iceConnectionState==='failed' && attempts.has(p.id)){
+          const was = active === p;
+          attempts.delete(p.id);
+          state('ice-failed');safeClose(p);
+          if(was){active=null;state('offline');}
+        }
+      };
       return p;
     }
     async function waitIce(pc){
@@ -89,15 +102,19 @@
       });
     }
     async function startOffer(s){
-      if(stopped || role!=='device' || isReady() || attempts.size>3 || s.readyState!==1)return;
+      if(stopped || role!=='device' || isReady() || s.readyState!==1)return;
+      // At most one pending offer per tracker. Retire stale offers promptly so a late
+      // office listener gets another chance within the phone's visible wait window.
+      for(const [k,p] of attempts){if(p.socket===s && !p.authorized){if(Date.now()-p.created<24000)return;safeClose(p);attempts.delete(k);}}
+      if(attempts.size>=4)return;
       const offerId=binary(rand(crypto,20));const p=createCandidate(offerId,s);
       try {
         attachChannel(p,p.pc.createDataChannel('michbasot-service-v1',{ordered:true}));
         await p.pc.setLocalDescription(await p.pc.createOffer());await waitIce(p.pc);
         if(stopped || !attempts.has(p.id))return;
         const packet=await authenticatedPacket('offer',offerId,ownPeer,'',p.pc.localDescription.sdp);
-        announce(s,[{offer_id:offerId,offer:packet}]);state('connecting');
-      }catch{ attempts.delete(p.id);safeClose(p); }
+        announce(s,[{offer_id:offerId,offer:packet}]);state('offer-sent');
+      }catch{ attempts.delete(p.id);safeClose(p);state('offer-failed'); }
     }
     async function receivedOffer(s,m){
       if(stopped || role!=='office' || isReady() || attempts.size>3 ||
@@ -113,7 +130,7 @@
         const packet=await authenticatedPacket('answer',m.offer_id,ownPeer,m.peer_id,p.pc.localDescription.sdp);
         sendIfOpen(s,{action:'announce',info_hash:room,peer_id:ownPeer,to_peer_id:m.peer_id,
           offer_id:m.offer_id,answer:packet});state('connecting');
-      }catch{ attempts.delete(p.id);safeClose(p); }
+      }catch{ attempts.delete(p.id);safeClose(p);state('answer-failed'); }
     }
     async function receivedAnswer(m){
       if(stopped || role!=='device' || !value(m.offer_id) || m.offer_id.length!==20 ||
@@ -123,7 +140,7 @@
       if(!await verified('answer',m.offer_id,m.peer_id,ownPeer,m.answer))return;
       state('answer-received');
       try{await p.pc.setRemoteDescription({type:'answer',sdp:m.answer.sdp});}
-      catch{ attempts.delete(p.id);safeClose(p); }
+      catch{ attempts.delete(p.id);safeClose(p);state('answer-failed'); }
     }
     async function incoming(p, data){
       if(stopped || !attempts.has(p.id) || typeof data !== 'string' || data.length>70000)return;
@@ -169,13 +186,15 @@
       if(stopped)return;
       let s;try{s=new WebSocketCtor(url);}catch{reconnectTracker(url);return;}
       trackSockets.set(url,s);
-      s.onopen=()=>{if(stopped)return;state('tracker-ready');announce(s);if(role==='device')startOffer(s);};
+      s.onopen=()=>{if(stopped)return;state('tracker-open');announce(s);if(role==='device')startOffer(s);};
       s.onmessage=event=>{
         if(stopped||typeof event.data!=='string'||event.data.length>90000)return;
         let m;try{m=JSON.parse(event.data);}catch{return;}
+        if(m?.action==='error'||m?.action==='warning'){state('tracker-error');return;}
         if(m?.action!=='announce'||m.info_hash!==room)return;
-        if(m.offer){receivedOffer(s,m).catch(()=>{});}
-        if(m.answer){receivedAnswer(m).catch(()=>{});}
+        if(typeof m.interval==='number')state('tracker-ready'); // tracker ACK, not mere socket open
+        if(m.offer){receivedOffer(s,m).catch(()=>state('offer-failed'));}
+        if(m.answer){receivedAnswer(m).catch(()=>state('answer-failed'));}
       };
       s.onclose=()=>{if(trackSockets.get(url)!==s)return;trackSockets.delete(url);reconnectTracker(url);};
       s.onerror=()=>{if(!stopped)state('tracker-error');};
@@ -189,9 +208,14 @@
       trackers.forEach(attachTracker);
       schedule=setInterval(()=>{
         if(stopped)return;
-        for(const [k,p] of attempts){if(Date.now()-p.created>70000 && !p.authorized){safeClose(p);attempts.delete(k);}}
-        if(!isReady() && role==='device')for(const s of trackSockets.values())startOffer(s);
-      }, Math.max(reconnectMs,14000));
+        for(const [k,p] of attempts){
+          if(Date.now()-p.created>30000 && !p.authorized){safeClose(p);attempts.delete(k);}
+        }
+        if(!isReady()){
+          if(role==='device')for(const s of trackSockets.values())startOffer(s);
+          else for(const s of trackSockets.values())announce(s); // renew office presence
+        }
+      }, Math.max(10000,Math.min(reconnectMs,15000)));
       timer=setInterval(()=>{
         if(!isReady())return;
         const now=Date.now();
