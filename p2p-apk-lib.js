@@ -133,6 +133,7 @@
       for(const [k,p] of attempts){if(p.socket===s && !p.authorized){if(Date.now()-p.created<24000)return;safeClose(p);attempts.delete(k);}}
       if(attempts.size>=4)return;
       const offerId=binary(rand(crypto,20));const p=createCandidate(offerId,s);
+      state('offer-preparing'); // ICE candidate collection may take up to 18 seconds.
       try {
         attachChannel(p,p.pc.createDataChannel('michbasot-service-v1',{ordered:true}));
         await p.pc.setLocalDescription(await p.pc.createOffer());await waitIce(p.pc);
@@ -236,7 +237,10 @@
       schedule=setInterval(()=>{
         if(stopped)return;
         for(const [k,p] of attempts){
-          if(Date.now()-p.created>30000 && !p.authorized){safeClose(p);attempts.delete(k);}
+          if(Date.now()-p.created>30000 && !p.authorized){
+            if(role==='device' && p.pc.signalingState==='have-local-offer')state('offer-timeout');
+            safeClose(p);attempts.delete(k);
+          }
         }
         if(!isReady()){
           if(role==='device')for(const s of trackSockets.values())startOffer(s);
