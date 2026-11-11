@@ -1,7 +1,5 @@
-/* R17: INSTALL ONLY. No OTP, code or phone entry in the public download page.
- * OTP is sent exactly once from the native Android app after installation.
- * P2P invitation token authorizes download of APK bytes ONLY.
- */
+/* R17: once the invited person downloads APK, an office-issued one-use
+ * handoff is opened from the same SMS page into the installed Android app. */
 (()=>{'use strict';
 const $=id=>document.getElementById(id);
 const tok=(new URLSearchParams(location.search).get('t')||new URLSearchParams(location.hash.replace(/^#/, '')).get('t')||'');
@@ -15,6 +13,7 @@ async function onData(m){
  if(!m||typeof m!=='object')return;
  if(m.kind==='apk_error'){fail(typeof m.message==='string'?m.message:'המשרד לא אישר את ההורדה.');return;}
  if(m.kind==='apk_meta'){
+  if(!/^[A-Za-z0-9_-]{40,90}$/.test(m.handoff||'')){fail('לא התקבל אישור כניסה חד-פעמי מהמשרד.');return;}
   if(!(m.role in names)||!Number.isInteger(m.size)||m.size<1024||m.size>40*1024*1024||
    !/^[a-f0-9]{64}$/.test(m.sha256||'')||m.chunks!==Math.ceil(m.size/24576)){
    fail('פרטי קובץ ההתקנה אינם תקינים.');return;
@@ -40,13 +39,17 @@ async function onData(m){
    if(sha!==meta.sha256){fail('הקובץ נפגם במהלך ההעברה.');return;}
    const a=$('download');a.href=URL.createObjectURL(blob);a.download=names[meta.role];
    a.classList.remove('hidden');$('progressBox').classList.add('hidden');$('retry').classList.add('hidden');
-   status('הקובץ מוכן. לחץ על ״הורדת האפליקציה״, התקן ופתח אותה. מספר הטלפון יוקלד בתוך האפליקציה.');
+   const open=$('openApp');
+   open.href='michbasot://'+meta.role+'?t='+encodeURIComponent(tok)+
+     '&handoff='+encodeURIComponent(meta.handoff);
+   open.classList.remove('hidden');
+   status('ההורדה מוכנה. התקן את ה-APK, חזור לדף הזה ולחץ ״כניסה לאפליקציה״. ללא SMS אימות נוסף.');
    busy=false;meta=null;chunks=[];clearTimeout(timer);
   }
  }
 }
 async function connect(){
- $('retry').classList.add('hidden');$('download').classList.add('hidden');
+ $('retry').classList.add('hidden');$('download').classList.add('hidden');$('openApp').classList.add('hidden');
  $('progressBox').classList.add('hidden');meta=null;chunks=[];
  if(!/^[A-Za-z0-9_-]{32,200}$/.test(tok)){fail('קישור ההזמנה חסר או לא תקין.');return;}
  if(!window.isSecureContext||!crypto?.subtle||!window.MichbasotDeviceLink){
