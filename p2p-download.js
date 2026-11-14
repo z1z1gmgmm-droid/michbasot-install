@@ -1,5 +1,4 @@
-/* R17: once the invited person downloads APK, an office-issued one-use
- * handoff is opened from the same SMS page into the installed Android app. */
+/* R31: invitation page UI only. Preserve R17 P2P APK transfer and integrity checks. */
 (()=>{'use strict';
 const $=id=>document.getElementById(id);
 const tok=(new URLSearchParams(location.search).get('t')||new URLSearchParams(location.hash.replace(/^#/, '')).get('t')||'');
@@ -39,17 +38,13 @@ async function onData(m){
    if(sha!==meta.sha256){fail('הקובץ נפגם במהלך ההעברה.');return;}
    const a=$('download');a.href=URL.createObjectURL(blob);a.download=names[meta.role];
    a.classList.remove('hidden');$('progressBox').classList.add('hidden');$('retry').classList.add('hidden');
-   const open=$('openApp');
-   open.href='michbasot://'+meta.role+'?t='+encodeURIComponent(tok)+
-     '&handoff='+encodeURIComponent(meta.handoff);
-   open.classList.remove('hidden');
-   status('ההורדה מוכנה. התקן את ה-APK, חזור לדף הזה ולחץ ״כניסה לאפליקציה״. ללא SMS אימות נוסף.');
+   status('');
    busy=false;meta=null;chunks=[];clearTimeout(timer);
   }
  }
 }
 async function connect(){
- $('retry').classList.add('hidden');$('download').classList.add('hidden');$('openApp').classList.add('hidden');
+ $('retry').classList.add('hidden');$('download').classList.add('hidden');
  $('progressBox').classList.add('hidden');meta=null;chunks=[];
  if(!/^[A-Za-z0-9_-]{32,200}$/.test(tok)){fail('קישור ההזמנה חסר או לא תקין.');return;}
  if(!window.isSecureContext||!crypto?.subtle||!window.MichbasotDeviceLink){
