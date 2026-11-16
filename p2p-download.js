@@ -1,6 +1,33 @@
 /* R17: once the invited person downloads APK, an office-issued one-use
  * handoff is opened from the same SMS page into the installed Android app. */
 (()=>{'use strict';
+
+/* R53: HTTPS distribution for new, office-issued role links. Legacy t links stay P2P. */
+const r53Params=new URLSearchParams(location.hash.replace(/^#/,''));
+const r53Roles={d:'driver',m:'manager',c:'client'};
+const r53Keys=Object.keys(r53Roles).filter(k=>r53Params.has(k));
+if(r53Keys.length){
+ const main=document.querySelector('main');main.setAttribute('data-mb-https','1');
+ const status=document.getElementById('status'), download=document.getElementById('download'), open=document.getElementById('openApp');
+ const invalid=()=>{status.textContent='קישור ההזמנה אינו תקין. יש לפנות למשרד.';};
+ if(r53Keys.length!==1||r53Params.getAll(r53Keys[0]).length!==1||r53Params.has('t')||new URLSearchParams(location.search).has('t')){invalid();return;}
+ const role=r53Roles[r53Keys[0]], token=r53Params.get(r53Keys[0]);
+ if(!/^[A-Za-z0-9_-]{43}$/.test(token)||location.origin!=='https://z1z1gmgmm-droid.github.io'||!location.pathname.startsWith('/michbasot-install/')){invalid();return;}
+ const files={driver:'Michbasot_Driver.apk',manager:'Michbasot_Manager.apk',client:'Michbasot_Client.apk'};
+ const root='https://github.com/z1z1gmgmm-droid/michbasot-install/releases/download/android-v56-aa262d6d/';
+ download.href=root+files[role];download.referrerPolicy='no-referrer';download.rel='noreferrer';
+ download.classList.remove('hidden');
+ status.textContent='לאחר התקנת האפליקציה, חזור לכאן ולחץ על כניסה לאפליקציה.';
+ // The release is public. The token and proof never appear in its URL or a request to GitHub.
+ // The office separately stores the expected proof hash, validates the phone and consumes the invitation.
+ if(!window.isSecureContext||!window.crypto||!crypto.subtle){status.textContent='הדפדפן אינו תומך בכניסה מאובטחת. פתח את ההזמנה בדפדפן מעודכן.';return;}
+ crypto.subtle.digest('SHA-256',new TextEncoder().encode('mb-https-install-v1:'+token)).then(sum=>{
+  const proof=Array.from(new Uint8Array(sum),x=>x.toString(16).padStart(2,'0')).join('');
+  open.href='michbasot://'+role+'?t='+encodeURIComponent(token)+'&handoff='+proof;
+  open.textContent='כניסה לאפליקציה לאחר ההתקנה';open.classList.remove('hidden');
+ }).catch(()=>{status.textContent='לא ניתן להכין כניסה מאובטחת. פתח שוב את ההזמנה.';});
+ return;
+}
 const $=id=>document.getElementById(id);
 const tok=(new URLSearchParams(location.search).get('t')||new URLSearchParams(location.hash.replace(/^#/, '')).get('t')||'');
 const names={driver:'Michbasot_Driver.apk',manager:'Michbasot_Manager.apk',client:'Michbasot_Client.apk'};
