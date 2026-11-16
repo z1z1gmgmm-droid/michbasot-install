@@ -244,7 +244,7 @@ async function r04UpdateBadge(){try{
   navigator.serviceWorker?.controller?.postMessage({type:'MB_R05_BADGE_SYNC',count});
 }catch{}}
 // MB_IOS_R05_WEB_PUSH: Do not modify login, message transport, media or P2P.
-let r05RegisteredScope='',r05Syncing=false,r05PendingHotel='';
+let r05RegisteredScope='',r05Syncing=false,r05PendingHotel='',r06LastWebPushSync=0;
 try{r05PendingHotel=new URLSearchParams(location.search).get('mbhotel')||'';}catch{}
 const r05Installed=()=>!!(window.matchMedia?.('(display-mode: standalone)').matches||navigator.standalone===true);
 function r05DecodeKey(s){const value=atob(s.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-s.length%4)%4));return Uint8Array.from(value,c=>c.charCodeAt(0));}
@@ -257,7 +257,7 @@ navigator.serviceWorker?.addEventListener?.('message',event=>{
   }
 });
 async function r05SyncPush(){
-  if(r05Syncing||r05RegisteredScope===cacheScope||!cacheScope||!online()||document.hidden||!r05Installed()||
+  if(r05Syncing||(r05RegisteredScope===cacheScope&&Date.now()-r06LastWebPushSync<3600000)||!cacheScope||!online()||document.hidden||!r05Installed()||
     !('serviceWorker' in navigator)||!('PushManager' in window)||
     !('Notification' in window)||Notification.permission!=='granted')return false;
   r05Syncing=true;

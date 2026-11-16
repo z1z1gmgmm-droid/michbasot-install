@@ -5,7 +5,7 @@ const FILES=['./','./index.html','./manifest.webmanifest','./ios-store.js',
   './p2p-device-link.js','./p2p-mobile-ios.js','./ios-bootstrap.js',
   './icons/icon-192.png','./icons/icon-512.png'];
 self.addEventListener('install', event=>event.waitUntil(
-  caches.open(CACHE).then(cache=>cache.addAll(FILES)).then(()=>self.skipWaiting())
+  caches.open(CACHE).then(cache=>Promise.allSettled(FILES.map(file=>cache.add(file)))).then(()=>self.skipWaiting())
 ));
 self.addEventListener('activate', event=>event.waitUntil(Promise.all([
   caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('mb-ios-shell-')&&k!==CACHE).map(k=>caches.delete(k)))),
