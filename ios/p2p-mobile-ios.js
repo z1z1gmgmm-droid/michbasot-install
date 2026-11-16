@@ -17,11 +17,11 @@
   let fetchInstalled=false;
   // Only these explicitly authorized JSON routes have a P2P backend implementation.
   function allowed(path,method){
-    if(method==='GET' && (path==='/api/me'||path==='/api/customers'||/^\/api\/p2p\/message-feed\?after=(?:-1|[0-9]{1,16})$/.test(path)))return true;
+    if(method==='GET' && (path==='/api/me'||path==='/api/customers'||path==='/api/push/vapid-public-key'||/^\/api\/p2p\/message-feed\?after=(?:-1|[0-9]{1,16})$/.test(path)))return true;
     if(method==='GET' && /^\/api\/messages\/[A-Za-z0-9_-]{1,80}\?translate=[A-Za-z0-9_-]{1,80}&lang=(?:he|en|ru|ar|es|hi|si|ta)$/.test(path))return true;
     if(method==='GET' && /^\/api\/p2p\/media\/[a-fA-F0-9]{32}\?offset=\d{1,10}$/.test(path))return true;
     if(method==='GET' && /^\/api\/(?:messages|gallery)\/[A-Za-z0-9_-]{1,80}(?:\?page=\d{1,5})?$/.test(path))return true;
-    return method==='POST' && (path==='/api/messages'||path==='/api/p2p/media');
+    return method==='POST' && (path==='/api/messages'||path==='/api/p2p/media'||path==='/api/push/subscribe'||path==='/api/push/unsubscribe');
   }
   function failPending(){
     for(const [id,entry] of pending){clearTimeout(entry.timer);

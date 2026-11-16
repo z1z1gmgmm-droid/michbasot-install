@@ -241,7 +241,46 @@ async function r04UpdateBadge(){try{
  const count=r04UnreadCount();
  if(count>0&&typeof navigator.setAppBadge==='function')await navigator.setAppBadge(count);
  else if(count===0&&typeof navigator.clearAppBadge==='function')await navigator.clearAppBadge();
+  navigator.serviceWorker?.controller?.postMessage({type:'MB_R05_BADGE_SYNC',count});
 }catch{}}
+// MB_IOS_R05_WEB_PUSH: Do not modify login, message transport, media or P2P.
+let r05RegisteredScope='',r05Syncing=false,r05PendingHotel='';
+try{r05PendingHotel=new URLSearchParams(location.search).get('mbhotel')||'';}catch{}
+const r05Installed=()=>!!(window.matchMedia?.('(display-mode: standalone)').matches||navigator.standalone===true);
+function r05DecodeKey(s){const value=atob(s.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-s.length%4)%4));return Uint8Array.from(value,c=>c.charCodeAt(0));}
+function r05OpenPending(){const id=r05PendingHotel;if(!/^[A-Za-z0-9_-]{1,80}$/.test(id))return;
+  if(typeof window.__mbR40OpenHotel==='function'){window.__mbR40OpenHotel(id);r05PendingHotel='';}}
+navigator.serviceWorker?.addEventListener?.('message',event=>{
+  const data=event.data||{};
+  if(data.type==='MB_R05_OPEN_HOTEL'&&typeof data.hotel==='string'){
+    r05PendingHotel=data.hotel;r05OpenPending();
+  }
+});
+async function r05SyncPush(){
+  if(r05Syncing||r05RegisteredScope===cacheScope||!cacheScope||!online()||document.hidden||!r05Installed()||
+    !('serviceWorker' in navigator)||!('PushManager' in window)||
+    !('Notification' in window)||Notification.permission!=='granted')return false;
+  r05Syncing=true;
+  try{
+    const response=await api('/api/push/vapid-public-key');
+    if(!response?.public_key)throw Error('Office Push not enabled');
+    const registration=await navigator.serviceWorker.register('./sw.js',{scope:'./',updateViaCache:'none'});
+    let subscription=await registration.pushManager.getSubscription();
+    if(!subscription){subscription=await registration.pushManager.subscribe({
+      userVisibleOnly:true,applicationServerKey:r05DecodeKey(response.public_key)
+    });}
+    const result=await api('/api/push/subscribe','POST',{subscription:subscription.toJSON()});
+    if(!result?.ok)throw Error('Subscription not confirmed by office');
+    r05RegisteredScope=cacheScope;
+    r04UpdatePermissionButton();
+    return true;
+  }catch(_err){return false;}
+  finally{r05Syncing=false;}
+}
+setInterval(()=>{
+  if(!document.hidden){r05OpenPending();if(Notification.permission==='granted')void r05SyncPush();}
+},15000);
+
 const r04Words={
  he:'🔔 הפעל התראות',ru:'🔔 Включить уведомления',en:'🔔 Enable alerts',ar:'🔔 تفعيل التنبيهات',
  es:'🔔 Activar avisos',hi:'🔔 सूचनाएँ चालू करें',si:'🔔 දැනුම්දීම් සක්‍රිය කරන්න',ta:'🔔 அறிவிப்புகள்'
@@ -250,17 +289,22 @@ function r04UpdatePermissionButton(){const b=$('mbR04Allow');if(!b)return;
  const installed=!!(window.matchMedia?.('(display-mode: standalone)').matches||navigator.standalone===true);
  const available=installed&&('Notification' in window)&&typeof Notification.requestPermission==='function';
  const enabled=available&&Notification.permission==='granted';
- b.hidden=!available||enabled;b.textContent=r04Words[uiLang]||r04Words.en;
+ b.hidden=!available||(enabled&&r05RegisteredScope===cacheScope);b.textContent=r04Words[uiLang]||r04Words.en;
 }
-$('mbR04Allow')?.addEventListener('click',()=>{
- // iOS requires a user gesture; never ask automatically during login or launch.
- try{const request=Notification.requestPermission();Promise.resolve(request).then(()=>{
-  r04UpdatePermissionButton();void r04UpdateBadge();
- }).catch(()=>{});}catch{}
+$('mbR04Allow')?.addEventListener('click',async()=>{
+ // iOS: permission request is triggered by this explicit user tap.
+ try{
+  if(Notification.permission!=='granted'){
+    const result=await Notification.requestPermission();
+    if(result!=='granted'){r04UpdatePermissionButton();return;}
+  }
+  await r05SyncPush();r04UpdatePermissionButton();void r04UpdateBadge();
+ }catch{r04UpdatePermissionButton();}
 });
 $('mbLang')?.addEventListener('change',()=>r04UpdatePermissionButton());
 r04UpdatePermissionButton();
 void r04UpdateBadge();
+setTimeout(r05OpenPending,1200);
 function r03MemoId(id){if(typeof id!=='string'||!id)return; r03RecentIds.add(id);
  if(r03RecentIds.size>500)r03RecentIds=new Set(Array.from(r03RecentIds).slice(-250));
 }
