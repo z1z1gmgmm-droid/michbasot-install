@@ -19,6 +19,7 @@
  try{
    const saved=await window.MichbasotIOSStore.read();
    if(saved&&(!role||role===saved.role)){
+     window.__mbSetIosRole?.(saved.role);
      // Remove one-use invitation from the running URL after verified local registration.
      if(location.hash)history.replaceState(null,'',location.pathname);
      await window.MichbasotMobileP2P.connect(saved.secret_hex);
