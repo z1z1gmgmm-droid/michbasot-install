@@ -1,0 +1,283 @@
+/*
+ * Michbasot Service: P2P R8 - tracker-compatible authenticated SDP signaling + bounded retry.
+ * NOT a complete app transport. Initial room signaling uses a public tracker; authenticated APK data travels on WebRTC.
+ * No hard-coded shared secret. Bootstrap room uses the one-time invitation token hash.
+ * Public WSS trackers only exchange SDP/ICE; keys and business data are not signaled.
+ * Public trackers can fail and STUN-only ICE will fail behind certain NATs.
+ * The application backend MUST authorize every business operation by device/user/hotel.
+ */
+(function (scope) {
+  'use strict';
+  const enc = new TextEncoder();
+  const defaultTrackers = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev'];
+  const defaultIce = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  const bytes = h => Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16));
+  const binary = a => Array.from(a, c => String.fromCharCode(c)).join('');
+  const rand = (crypto, n) => crypto.getRandomValues(new Uint8Array(n));
+  const value = s => typeof s === 'string' && s.length > 0 && s.length < 70000;
+
+  async function deriveRoom(secretHex, crypto = scope.crypto) {
+    if (!/^[a-fA-F0-9]{64}$/.test(secretHex || '')) throw new Error('Unique 32-byte per-device key required');
+    const data = enc.encode('michbasot-service-device-room-v1:' + secretHex.toLowerCase());
+    return binary(new Uint8Array(await crypto.subtle.digest('SHA-1', data)));
+  }
+  async function hmac(secretHex, message, crypto = scope.crypto) {
+    if (!/^[a-fA-F0-9]{64}$/.test(secretHex || '')) throw new Error('Invalid device key');
+    const key = await crypto.subtle.importKey('raw', bytes(secretHex), {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+    return hex(new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message))));
+  }
+  const macInput = (type, id, sender, target, sdp) =>
+    `mb-service-p2p-signaling-v1\n${type}\n${hex(enc.encode(id))}\n${hex(enc.encode(sender))}\n${hex(enc.encode(target || ''))}\n${sdp}`;
+  const proofInput = (role, ownNonce, otherNonce) =>
+    `mb-service-p2p-auth-v1\n${role}\n${ownNonce}\n${otherNonce}`;
+  async function makeAuthProof(secretHex, role, ownNonce, otherNonce, crypto = scope.crypto) {
+    return hmac(secretHex, proofInput(role, ownNonce, otherNonce), crypto);
+  }
+  // WebTorrent/Aquatic trackers parse an RTC offer/answer as {type,sdp} only.
+  // They can discard custom JSON fields (including mac), which previously made
+  // a valid offer unverifiable at the office. Carry the MAC inside the SDP text
+  // and remove it *before* calling WebRTC. Fail closed if proof is missing/bad.
+  const PROOF_LINE = 'a=x-michbasot-proof:';
+  function unpackSignal(type, p) {
+    if (!p || p.type !== type || !value(p.sdp) || p.sdp.length >= 30000 ||
+        !p.sdp.startsWith('v=0')) return null;
+    const index = p.sdp.lastIndexOf(PROOF_LINE);
+    if (index >= 2 && p.sdp.slice(index-2,index) === '\r\n' &&
+        p.sdp.endsWith('\r\n')) {
+      const mac = p.sdp.slice(index + PROOF_LINE.length, -2);
+      if (/^[a-f0-9]{64}$/i.test(mac)) {
+        const sdp = p.sdp.slice(0,index);
+        return {sdp,mac:mac.toLowerCase()};
+      }
+      return null;
+    }
+    // Preserve read-only parsing for older R6 signaling if the tracker keeps
+    // extra JSON fields; the new sender always uses embedded proof.
+    if (/^[a-f0-9]{64}$/i.test(p.mac || '')) return {sdp:p.sdp,mac:p.mac.toLowerCase()};
+    return null;
+  }
+  function validPeerPacket(type,p) { return !!unpackSignal(type,p); }
+
+  function createDeviceLink({role, secretHex, trackers=defaultTrackers, iceServers=defaultIce,
+       onStatus=()=>{}, onData=()=>{}, onDiagnostic=null, crypto=scope.crypto, WebSocketCtor=scope.WebSocket,
+       RtcCtor=scope.RTCPeerConnection, reconnectMs=17000}={}) {
+    if (!['office','device'].includes(role)) throw new Error('Invalid role');
+    if (!/^[a-fA-F0-9]{64}$/.test(secretHex || '')) throw new Error('Unique 32-byte key required');
+    if (!crypto?.subtle || !crypto?.getRandomValues || !WebSocketCtor || !RtcCtor)
+      throw new Error('Secure WebRTC and WebCrypto browser environment required');
+    let room, ownPeer, stopped=true, active=null, trackSockets=new Map(), attempts=new Map();
+    let schedule=null, timer=null, lastPong=0, lastPing=0;
+    const state = (v) => { if (!stopped) onStatus(v); };
+    const diag=(stage,socket,detail='')=>{if(stopped||typeof onDiagnostic!=='function')return;
+      let index=0;for(const [url,ws] of trackSockets){if(ws===socket){index=trackers.indexOf(url)+1;break;}}
+      try{onDiagnostic(stage,index,String(detail));}catch{} };
+    const enrollDiagnostic=typeof onDiagnostic==='function' && role==='device';
+    function candidateCounts(pc){const s=pc.localDescription?.sdp||'';return ['host','srflx','relay'].map(t=>t+'='+((s.match(new RegExp(' typ '+t+'(?: |\\r|\\n|$)','g'))||[]).length)).join(' ');}
+    const isReady = () => !!active && active.authorized && active.channel?.readyState === 'open' &&
+      active.pc.connectionState !== 'failed';
+    const sendIfOpen = (s,m) => { if (s && s.readyState === 1) s.send(JSON.stringify(m)); };
+    const safeClose = (p) => {if (!p) return;try{p.channel?.close();}catch{}try{p.pc.close();}catch{}};
+    function closePeers(){for(const p of attempts.values())safeClose(p);attempts.clear();active=null;}
+    function sendToTrackers(m) {for(const s of trackSockets.values())sendIfOpen(s,m);}
+    function announce(s, offers=[]) {
+      sendIfOpen(s,{action:'announce',info_hash:room,peer_id:ownPeer,uploaded:0,downloaded:0,
+        left:1,event:'started',numwant:Math.min(offers.length,5),offers});
+    }
+    async function authenticatedPacket(type,id,sender,target,sdp) {
+      // Normalize SDP line endings to guarantee the signed and transmitted
+      // bytes are identical. Extra proof is NOT passed to RTCPeerConnection.
+      const pure = sdp.endsWith('\r\n') ? sdp : sdp + '\r\n';
+      const mac = await hmac(secretHex,macInput(type,id,sender,target,pure),crypto);
+      return {type,sdp:pure + PROOF_LINE + mac + '\r\n'};
+    }
+    async function verified(type,id,sender,target,packet){
+      const unpacked = unpackSignal(type,packet);
+      if(!unpacked)return null;
+      const expect = await hmac(secretHex,macInput(type,id,sender,target,unpacked.sdp),crypto);
+      return expect === unpacked.mac ? unpacked.sdp : null;
+    }
+    function createCandidate(id, socket){
+      const pc = new RtcCtor({iceServers});
+      const p={id,pc,socket,channel:null,ours:null,theirs:null,proved:false,proofSent:false,authorized:false,created:Date.now(),sentAt:0};
+      attempts.set(id,p);
+      pc.ondatachannel=e=>attachChannel(p,e.channel);
+      pc.onconnectionstatechange=()=>{
+        diag('connection',socket,pc.connectionState);
+        if(['failed','closed','disconnected'].includes(pc.connectionState)){
+          const was = active === p;
+          attempts.delete(p.id);
+          if(pc.connectionState==='failed')state('ice-failed');
+          safeClose(p);
+          if(was){active=null;state('offline');}
+        }
+      };
+      pc.oniceconnectionstatechange=()=>{
+        diag('ice',socket,pc.iceConnectionState);
+        if(pc.iceConnectionState==='failed' && attempts.has(p.id)){
+          const was = active === p;
+          attempts.delete(p.id);
+          state('ice-failed');safeClose(p);
+          if(was){active=null;state('offline');}
+        }
+      };
+      return p;
+    }
+    const fastIceSockets=new WeakSet();
+    async function waitIce(pc,fastAttempt=false){
+      if(pc.iceGatheringState==='complete')return;
+      await new Promise(resolve=>{
+        let done=false;let boost=null;const complete=()=>{if(done)return;done=true;clearTimeout(timeout);if(boost!==null)clearTimeout(boost);
+          pc.removeEventListener('icegatheringstatechange', changed);resolve();};
+        const changed=()=>{if(pc.iceGatheringState==='complete')complete();};
+        pc.addEventListener('icegatheringstatechange',changed);
+        const timeout=setTimeout(complete,18000);
+        // If a usable public candidate is already gathered, avoid waiting for an unresponsive STUN server.
+        if(fastAttempt)boost=setTimeout(()=>{if(/ typ (?:srflx|relay) /i.test(pc.localDescription?.sdp||''))complete();},8000);
+      });
+    }
+    async function startOffer(s){
+      if(stopped || role!=='device' || isReady() || s.readyState!==1)return;
+      // At most one pending offer per tracker. Retire stale offers promptly so a late
+      // office listener gets another chance within the phone's visible wait window.
+      for(const [k,p] of attempts){if(p.socket===s && !p.authorized){if(enrollDiagnostic ? (p.sentAt ? Date.now()-p.sentAt<45000 : Date.now()-p.created<30000) : Date.now()-p.created<20000)return;safeClose(p);attempts.delete(k);}}
+      if(attempts.size>=4)return;
+      const offerId=binary(rand(crypto,20));const p=createCandidate(offerId,s);
+      state('offer-preparing');diag('offer-preparing',s); // ICE gathering may take up to 18 seconds.
+      try {
+        attachChannel(p,p.pc.createDataChannel('michbasot-service-v1',{ordered:true}));
+        const fastAttempt=!fastIceSockets.has(s);fastIceSockets.add(s);
+        await p.pc.setLocalDescription(await p.pc.createOffer());await waitIce(p.pc,fastAttempt);
+        if(stopped || !attempts.has(p.id))return;
+        const packet=await authenticatedPacket('offer',offerId,ownPeer,'',p.pc.localDescription.sdp);
+        diag('offer-candidates',s,candidateCounts(p.pc));
+        if(s.readyState!==1){diag('socket-closed-before-offer',s);attempts.delete(p.id);safeClose(p);return;}
+        announce(s,[{offer_id:offerId,offer:packet}]);p.sentAt=Date.now();state('offer-sent');diag('offer-sent',s);
+      }catch(e){ diag('offer-failed',s,e?.name||'Error');attempts.delete(p.id);safeClose(p);state('offer-failed'); }
+    }
+    async function receivedOffer(s,m){
+      if(stopped || role!=='office' || isReady() || attempts.size>3 ||
+         !value(m.offer_id) || m.offer_id.length!==20 || !value(m.peer_id) || m.peer_id.length!==20 || m.peer_id===ownPeer)return;
+      // Fail CLOSED. Never process or respond to unauthenticated SDP.
+      const verifiedSdp = await verified('offer',m.offer_id,m.peer_id,'',m.offer);
+      if(verifiedSdp === null)return;
+      state('offer-received');
+      const p=createCandidate('answer:'+hex(enc.encode(m.offer_id)),s);
+      try{
+        await p.pc.setRemoteDescription({type:'offer',sdp:verifiedSdp});
+        await p.pc.setLocalDescription(await p.pc.createAnswer());await waitIce(p.pc);
+        if(stopped || !attempts.has(p.id))return;
+        const packet=await authenticatedPacket('answer',m.offer_id,ownPeer,m.peer_id,p.pc.localDescription.sdp);
+        sendIfOpen(s,{action:'announce',info_hash:room,peer_id:ownPeer,to_peer_id:m.peer_id,
+          offer_id:m.offer_id,answer:packet});state('connecting');
+      }catch{ attempts.delete(p.id);safeClose(p);state('answer-failed'); }
+    }
+    async function receivedAnswer(m){
+      if(stopped || role!=='device' || !value(m.offer_id) || m.offer_id.length!==20 ||
+         !value(m.peer_id) || m.peer_id.length!==20)return;
+      const p=attempts.get(m.offer_id);
+      if(!p || p.pc.signalingState!=='have-local-offer'){diag('answer-stale',p?.socket);return;}
+      const verifiedSdp = await verified('answer',m.offer_id,m.peer_id,ownPeer,m.answer);
+      if(verifiedSdp === null){diag('answer-auth-rejected',p.socket);return;}
+      state('answer-received');diag('answer-auth-ok',p.socket);
+      try{await p.pc.setRemoteDescription({type:'answer',sdp:verifiedSdp});}
+      catch(e){ diag('answer-apply-failed',p.socket,e?.name||'Error');attempts.delete(p.id);safeClose(p);state('answer-failed'); }
+    }
+    async function incoming(p, data){
+      if(stopped || !attempts.has(p.id) || typeof data !== 'string' || data.length>70000)return;
+      let m;try{m=JSON.parse(data);}catch{return;}
+      const ch=p.channel;
+      if(m?.kind==='hello' && !p.authorized){
+        if(m.role === role || !['office','device'].includes(m.role) || !/^[a-f0-9]{64}$/.test(m.nonce || '')){ch.close();return;}
+        if(p.theirs && p.theirs!==m.nonce){ch.close();return;}
+        p.theirs=m.nonce;
+        if(!p.proofSent && p.ours){p.proofSent=true;
+          ch.send(JSON.stringify({kind:'proof', proof:await makeAuthProof(secretHex,role,p.ours,p.theirs,crypto)}));}
+      } else if(m?.kind==='proof' && !p.authorized){
+        if(!p.theirs || !/^[a-f0-9]{64}$/.test(m.proof || '')){ch.close();return;}
+        const otherRole=role==='office'?'device':'office';
+        const expected=await makeAuthProof(secretHex,otherRole,p.theirs,p.ours,crypto);
+        if(expected!==m.proof.toLowerCase()){ch.close();return;}
+        p.proved=true;
+        if(p.proofSent){
+          // Only one authenticated device per unique per-device key.
+          if(active && active!==p)safeClose(active);
+          active=p;p.authorized=true;lastPong=Date.now();
+          for(const [k,other] of attempts){if(other!==p){safeClose(other);attempts.delete(k);}}
+          state('online');diag('peer-auth-ok',p.socket);
+        }
+      } else if(p.authorized){
+        if(m.kind==='ping'){ch.send(JSON.stringify({kind:'pong',t:m.t}));}
+        else if(m.kind==='pong' && typeof m.t==='number'){lastPong=Date.now();}
+        else if(m.kind==='payload' && typeof m.value==='object' && m.value!==null &&
+          JSON.stringify(m.value).length < 60000) onData(m.value);
+      }
+    }
+    function attachChannel(p,ch){
+      p.channel=ch;
+      ch.onopen=()=>{
+        diag('data-channel-open',p.socket);
+        p.ours=hex(rand(crypto,32));
+        ch.send(JSON.stringify({kind:'hello',role,nonce:p.ours}));
+      };
+      ch.onmessage=e=>incoming(p,e.data).catch(()=>{try{ch.close();}catch{}});
+      ch.onclose=()=>{const was=active===p;attempts.delete(p.id);safeClose(p);
+        if(was){active=null;state('offline');}};
+    }
+    function attachTracker(url){
+      if(stopped)return;
+      let s;try{s=new WebSocketCtor(url);}catch{reconnectTracker(url);return;}
+      trackSockets.set(url,s);
+      s.onopen=()=>{if(stopped)return;diag('tracker-open',s);state('tracker-open');announce(s);if(role==='device')startOffer(s);};
+      s.onmessage=event=>{
+        if(stopped||typeof event.data!=='string'||event.data.length>90000)return;
+        let m;try{m=JSON.parse(event.data);}catch{return;}
+        if(m?.action==='error'||m?.action==='warning'){state('tracker-error');return;}
+        if(m?.action!=='announce'||m.info_hash!==room)return;
+        if(typeof m.interval==='number'){state('tracker-ready');diag('tracker-ack',s);} // tracker ACK, not mere socket open
+        if(m.offer){receivedOffer(s,m).catch(()=>state('offer-failed'));}
+        if(m.answer){receivedAnswer(m).catch(()=>state('answer-failed'));}
+      };
+      s.onclose=e=>{if(trackSockets.get(url)!==s)return;diag('tracker-close',s,String(e?.code||0));trackSockets.delete(url);reconnectTracker(url);};
+      s.onerror=()=>{if(!stopped){diag('tracker-error',s);state('tracker-error');}};
+    }
+    function reconnectTracker(url){if(!stopped)setTimeout(()=>attachTracker(url),(role==='device'?1000:4000)+Math.floor(Math.random()*(role==='device'?2000:4000)));}
+    async function start(){
+      if(!stopped)return;
+      stopped=false;
+      room=await deriveRoom(secretHex,crypto);ownPeer=binary(rand(crypto,20));
+      state('offline');
+      trackers.forEach(attachTracker);
+      schedule=setInterval(()=>{
+        if(stopped)return;
+        for(const [k,p] of attempts){
+          if((enrollDiagnostic ? (p.sentAt ? Date.now()-p.sentAt>45000 : Date.now()-p.created>30000) : Date.now()-p.created>30000) && !p.authorized){
+            diag('attempt-timeout',p.socket);
+            if(role==='device' && p.pc.signalingState==='have-local-offer')state('offer-timeout');
+            safeClose(p);attempts.delete(k);
+          }
+        }
+        if(!isReady()){
+          if(role==='device')for(const s of trackSockets.values())startOffer(s);
+          else for(const s of trackSockets.values())announce(s); // renew office presence
+        }
+      }, role==='device'?5000:Math.max(10000,Math.min(reconnectMs,15000)));
+      timer=setInterval(()=>{
+        if(!isReady())return;
+        const now=Date.now();
+        if(now-lastPong>40000){safeClose(active);active=null;state('offline');return;}
+        if(now-lastPing>12000){lastPing=now;active.channel.send(JSON.stringify({kind:'ping',t:now}));}
+      },5000);
+    }
+    function stop(){stopped=true;clearInterval(schedule);clearInterval(timer);
+      for(const s of trackSockets.values())try{s.close();}catch{}
+      trackSockets.clear();closePeers();}
+    function send(data){if(!isReady())return false;const raw=JSON.stringify(data);
+      if(raw.length>60000)throw new Error('Payload exceeds 60 KB; photos need chunked authorized transport');
+      active.channel.send(JSON.stringify({kind:'payload',value:data}));return true;}
+    return Object.freeze({start,stop,send,isReady});
+  }
+  const exported={createDeviceLink,deriveRoom,hmac,makeAuthProof,macInput,validPeerPacket};
+  if(typeof module !== 'undefined' && module.exports)module.exports=exported;
+  else scope.MichbasotDeviceLink=Object.freeze(exported);
+})(typeof globalThis === 'undefined' ? this : globalThis);
