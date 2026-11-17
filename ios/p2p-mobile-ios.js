@@ -238,7 +238,7 @@
     },
     async enrollFromInvitation(inviteHash,proof,phone,role){
       if(!/^[a-f0-9]{64}$/.test(inviteHash||'')||! /^[A-Za-z0-9_-]{40,90}$/.test(proof||'')||
-         !/^05[0-9]{8}$/.test(phone||'')||!['driver','manager','client'].includes(role))throw Error('פרטי ההזמנה חסרים');
+         !(/^(?:05[0-9]{8}|\+[1-9][0-9]{7,14})$/.test(phone||''))||!['driver','manager','client'].includes(role))throw Error('פרטי ההזמנה חסרים');
       scope.__mbR55Trace?.('enroll-start',0,'');
       const key=await roomKey('enroll',inviteHash);
       scope.__mbR55Trace?.('room-derived',0,'');
